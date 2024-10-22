@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from .base import BaseKVStorage
 from .utils import compute_args_hash, wrap_embedding_func_with_attrs
-
+from vllm import LLM
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -422,6 +422,50 @@ async def ollama_embedding(texts: list[str], embed_model) -> np.ndarray:
         embed_text.append(data["embedding"])
 
     return embed_text
+
+
+async def vllm_model_complete(
+    prompt, system_prompt=None, history_messages=[], **kwargs
+) -> str:
+    model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
+    return await vllm_model_if_cache(
+        model_name,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+
+
+
+async def vllm_model_if_cache(
+    model, prompt, system_prompt=None, history_messages=[], **kwargs
+) -> str:
+    vllm_client = LLM(model=model)
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": prompt})
+
+    hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
+    if hashing_kv is not None:
+        args_hash = compute_args_hash(model, messages)
+        if_cache_return = await hashing_kv.get_by_id(args_hash)
+        if if_cache_return is not None:
+            return if_cache_return["return"]
+
+    # Call the vLLM client to process the chat
+    response = vllm_client.generate(messages=messages, **kwargs)
+
+    result = response["output"]
+
+    if hashing_kv is not None:
+        await hashing_kv.upsert({args_hash: {"return": result, "model": model}})
+
+    return result
+
 
 
 if __name__ == "__main__":
